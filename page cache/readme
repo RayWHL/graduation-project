@@ -1,1 +1,5 @@
 memory cgroup中page cache 统计问题
+
+19/12/21
+mmap的page cache统计问题解决方案：vma增加相关计数位
+read相关page cache分析

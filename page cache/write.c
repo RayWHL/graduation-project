@@ -14,6 +14,37 @@ const struct address_space_operations cifs_addr_ops = {
 	.launder_page = cifs_launder_page,
 };
 
+static const struct address_space_operations ext4_aops = {
+	.readpage		= ext4_readpage,
+	.readpages		= ext4_readpages,
+	.writepage		= ext4_writepage,
+	.writepages		= ext4_writepages,
+	.write_begin		= ext4_write_begin,
+	.write_end		= ext4_write_end,
+	.set_page_dirty		= ext4_set_page_dirty,
+	.bmap			= ext4_bmap,
+	.invalidatepage		= ext4_invalidatepage,
+	.releasepage		= ext4_releasepage,
+	.direct_IO		= ext4_direct_IO,
+	.migratepage		= buffer_migrate_page,
+	.is_partially_uptodate  = block_is_partially_uptodate,
+	.error_remove_page	= generic_error_remove_page,
+};
+
+const struct address_space_operations ext2_aops = {
+	.readpage		= ext2_readpage,
+	.readpages		= ext2_readpages,
+	.writepage		= ext2_writepage,
+	.write_begin		= ext2_write_begin,
+	.write_end		= ext2_write_end,
+	.bmap			= ext2_bmap,
+	.direct_IO		= ext2_direct_IO,
+	.writepages		= ext2_writepages,
+	.migratepage		= buffer_migrate_page,
+	.is_partially_uptodate	= block_is_partially_uptodate,
+	.error_remove_page	= generic_error_remove_page,
+};
+
 SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
 		size_t, count)
 {

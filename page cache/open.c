@@ -10,29 +10,6 @@ SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
 	return do_sys_open(AT_FDCWD, filename, flags, mode);
 }
 
-struct nameidata {
-	struct path	path;
-	struct qstr	last;
-	struct path	root;
-	struct inode	*inode; /* path.dentry.d_inode */
-	unsigned int	flags;
-	unsigned	seq, m_seq;
-	int		last_type;
-	unsigned	depth;
-	int		total_link_count;
-	struct saved {
-		struct path link;
-		struct delayed_call done;
-		const char *name;
-		unsigned seq;
-	} *stack, internal[EMBEDDED_LEVELS];
-	struct filename	*name;
-	struct nameidata *saved;
-	struct inode	*link_inode;
-	unsigned	root_seq;
-	int		dfd;
-} __randomize_layout;
-
 
 struct open_flags {
 	int open_flag;
@@ -77,7 +54,7 @@ struct file *do_filp_open(int dfd, struct filename *pathname,
 	int flags = op->lookup_flags;
 	struct file *filp;
 
-	set_nameidata(&nd, dfd, pathname);
+	set_nameidata(&nd, dfd, pathname);		//设置nd，不包括inode
 	filp = path_openat(&nd, op, flags | LOOKUP_RCU);
 	if (unlikely(filp == ERR_PTR(-ECHILD)))
 		filp = path_openat(&nd, op, flags);
@@ -126,74 +103,88 @@ static struct file *path_openat(struct nameidata *nd,
 	return ERR_PTR(error);
 }
 
-/* Find an unused file structure and return a pointer to it.
- * Returns an error pointer if some error happend e.g. we over file
- * structures limit, run out of memory or operation is not permitted.
- *
- * Be very careful using this.  You are responsible for
- * getting write access to any mount that you might assign
- * to this filp, if it is opened for write.  If this is not
- * done, you will imbalance int the mount's writer count
- * and a warning at __fput() time.
- */
-struct file *alloc_empty_file(int flags, const struct cred *cred)
+/* must be paired with terminate_walk() */
+static const char *path_init(struct nameidata *nd, unsigned flags)
 {
-	static long old_max;
-	struct file *f;
+	const char *s = nd->name->name;
 
-	/*
-	 * Privileged users can go above max_files
-	 */
-	if (get_nr_files() >= files_stat.max_files && !capable(CAP_SYS_ADMIN)) {
-		/*
-		 * percpu_counters are inaccurate.  Do an expensive check before
-		 * we go and fail.
-		 */
-		if (percpu_counter_sum_positive(&nr_files) >= files_stat.max_files)
-			goto over;
+	if (!*s)
+		flags &= ~LOOKUP_RCU;
+	if (flags & LOOKUP_RCU)
+		rcu_read_lock();
+
+	nd->last_type = LAST_ROOT; /* if there are only slashes... */
+	nd->flags = flags | LOOKUP_JUMPED | LOOKUP_PARENT;
+	nd->depth = 0;
+	if (flags & LOOKUP_ROOT) {
+		struct dentry *root = nd->root.dentry;
+		struct inode *inode = root->d_inode;
+		if (*s && unlikely(!d_can_lookup(root)))
+			return ERR_PTR(-ENOTDIR);
+		nd->path = nd->root;
+		nd->inode = inode;
+		if (flags & LOOKUP_RCU) {
+			nd->seq = __read_seqcount_begin(&nd->path.dentry->d_seq);
+			nd->root_seq = nd->seq;
+			nd->m_seq = read_seqbegin(&mount_lock);
+		} else {
+			path_get(&nd->path);
+		}
+		return s;
 	}
 
-	f = __alloc_file(flags, cred);
-	if (!IS_ERR(f))
-		percpu_counter_inc(&nr_files);
+	nd->root.mnt = NULL;
+	nd->path.mnt = NULL;
+	nd->path.dentry = NULL;
 
-	return f;
+	nd->m_seq = read_seqbegin(&mount_lock);
+	if (*s == '/') {
+		set_root(nd);
+		if (likely(!nd_jump_root(nd)))
+			return s;
+		return ERR_PTR(-ECHILD);
+	} else if (nd->dfd == AT_FDCWD) {
+		if (flags & LOOKUP_RCU) {
+			struct fs_struct *fs = current->fs;
+			unsigned seq;
 
-over:
-	/* Ran out of filps - report that */
-	if (get_nr_files() > old_max) {
-		pr_info("VFS: file-max limit %lu reached\n", get_max_files());
-		old_max = get_nr_files();
+			do {
+				seq = read_seqcount_begin(&fs->seq);
+				nd->path = fs->pwd;
+				nd->inode = nd->path.dentry->d_inode;
+				nd->seq = __read_seqcount_begin(&nd->path.dentry->d_seq);
+			} while (read_seqcount_retry(&fs->seq, seq));
+		} else {
+			get_fs_pwd(current->fs, &nd->path);
+			nd->inode = nd->path.dentry->d_inode;
+		}
+		return s;
+	} else {
+		/* Caller must check execute permissions on the starting path component */
+		struct fd f = fdget_raw(nd->dfd);
+		struct dentry *dentry;
+
+		if (!f.file)
+			return ERR_PTR(-EBADF);
+
+		dentry = f.file->f_path.dentry;
+
+		if (*s && unlikely(!d_can_lookup(dentry))) {
+			fdput(f);
+			return ERR_PTR(-ENOTDIR);
+		}
+
+		nd->path = f.file->f_path;
+		if (flags & LOOKUP_RCU) {
+			nd->inode = nd->path.dentry->d_inode;
+			nd->seq = read_seqcount_begin(&nd->path.dentry->d_seq);
+		} else {
+			path_get(&nd->path);
+			nd->inode = nd->path.dentry->d_inode;
+		}
+		fdput(f);
+		return s;
 	}
-	return ERR_PTR(-ENFILE);
-}
-
-static struct file *__alloc_file(int flags, const struct cred *cred)
-{
-	struct file *f;
-	int error;
-
-	f = kmem_cache_zalloc(filp_cachep, GFP_KERNEL);
-	if (unlikely(!f))
-		return ERR_PTR(-ENOMEM);
-
-	f->f_cred = get_cred(cred);
-	error = security_file_alloc(f);
-	if (unlikely(error)) {
-		file_free_rcu(&f->f_u.fu_rcuhead);
-		return ERR_PTR(error);
-	}
-
-	atomic_long_set(&f->f_count, 1);
-	rwlock_init(&f->f_owner.lock);
-	spin_lock_init(&f->f_lock);
-	mutex_init(&f->f_pos_lock);
-	eventpoll_init_file(f);
-	f->f_flags = flags;
-	f->f_mode = OPEN_FMODE(flags);
-	/* f->f_version: 0 */
-
-	return f;
 }
 
 

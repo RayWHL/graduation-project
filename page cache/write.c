@@ -336,7 +336,7 @@ again:
 		}
 
 		status = a_ops->write_begin(file, mapping, pos, bytes, flags,
-						&page, &fsdata);
+						&page, &fsdata);			//ext4_write_begin
 		if (unlikely(status < 0))
 			break;
 
@@ -375,4 +375,303 @@ again:
 	} while (iov_iter_count(i));
 	return written ? written : status;
 }
-	
+
+//pagep为返回值
+static int ext4_write_begin(struct file *file, struct address_space *mapping,
+			    loff_t pos, unsigned len, unsigned flags,
+			    struct page **pagep, void **fsdata)
+{
+	struct inode *inode = mapping->host;
+	int ret, needed_blocks;
+	handle_t *handle;
+	int retries = 0;
+	struct page *page;
+	pgoff_t index;
+	unsigned from, to;
+
+	if (unlikely(ext4_forced_shutdown(EXT4_SB(inode->i_sb))))
+		return -EIO;
+
+	trace_ext4_write_begin(inode, pos, len, flags);
+	/*
+	 * Reserve one block more for addition to orphan list in case
+	 * we allocate blocks but write fails for some reason
+	 */
+	needed_blocks = ext4_writepage_trans_blocks(inode) + 1;
+	index = pos >> PAGE_SHIFT;
+	from = pos & (PAGE_SIZE - 1);
+	to = from + len;
+
+	if (ext4_test_inode_state(inode, EXT4_STATE_MAY_INLINE_DATA)) {
+		ret = ext4_try_to_write_inline_data(mapping, inode, pos, len,
+						    flags, pagep);		
+		if (ret < 0)
+			return ret;
+		if (ret == 1)
+			return 0;
+	}
+
+	/*
+	 * grab_cache_page_write_begin() can take a long time if the
+	 * system is thrashing due to memory pressure, or if the page
+	 * is being written back.  So grab it first before we start
+	 * the transaction handle.  This also allows us to allocate
+	 * the page (if needed) without using GFP_NOFS.
+	 */
+retry_grab:
+	page = grab_cache_page_write_begin(mapping, index, flags);		//ext4_try_to_write_inline_data中同样调用了改函数用于查找page cache
+	if (!page)
+		return -ENOMEM;
+	unlock_page(page);
+
+retry_journal:
+	handle = ext4_journal_start(inode, EXT4_HT_WRITE_PAGE, needed_blocks);
+	if (IS_ERR(handle)) {
+		put_page(page);
+		return PTR_ERR(handle);
+	}
+
+	lock_page(page);
+	if (page->mapping != mapping) {
+		/* The page got truncated from under us */
+		unlock_page(page);
+		put_page(page);
+		ext4_journal_stop(handle);
+		goto retry_grab;
+	}
+	/* In case writeback began while the page was unlocked */
+	wait_for_stable_page(page);
+
+#ifdef CONFIG_FS_ENCRYPTION
+	if (ext4_should_dioread_nolock(inode))
+		ret = ext4_block_write_begin(page, pos, len,
+					     ext4_get_block_unwritten);
+	else
+		ret = ext4_block_write_begin(page, pos, len,
+					     ext4_get_block);
+#else
+	if (ext4_should_dioread_nolock(inode))
+		ret = __block_write_begin(page, pos, len,
+					  ext4_get_block_unwritten);
+	else
+		ret = __block_write_begin(page, pos, len, ext4_get_block);
+#endif
+	if (!ret && ext4_should_journal_data(inode)) {
+		ret = ext4_walk_page_buffers(handle, page_buffers(page),
+					     from, to, NULL,
+					     do_journal_get_write_access);
+	}
+
+	if (ret) {
+		bool extended = (pos + len > inode->i_size) &&
+				!ext4_verity_in_progress(inode);
+
+		unlock_page(page);
+		/*
+		 * __block_write_begin may have instantiated a few blocks
+		 * outside i_size.  Trim these off again. Don't need
+		 * i_size_read because we hold i_mutex.
+		 *
+		 * Add inode to orphan list in case we crash before
+		 * truncate finishes
+		 */
+		if (extended && ext4_can_truncate(inode))
+			ext4_orphan_add(handle, inode);
+
+		ext4_journal_stop(handle);
+		if (extended) {
+			ext4_truncate_failed_write(inode);
+			/*
+			 * If truncate failed early the inode might
+			 * still be on the orphan list; we need to
+			 * make sure the inode is removed from the
+			 * orphan list in that case.
+			 */
+			if (inode->i_nlink)
+				ext4_orphan_del(NULL, inode);
+		}
+
+		if (ret == -ENOSPC &&
+		    ext4_should_retry_alloc(inode->i_sb, &retries))
+			goto retry_journal;
+		put_page(page);
+		return ret;
+	}
+	*pagep = page;
+	return ret;
+}
+
+/*
+ * Try to write data in the inode.
+ * If the inode has inline data, check whether the new write can be
+ * in the inode also. If not, create the page the handle, move the data
+ * to the page make it update and let the later codes create extent for it.
+ */
+int ext4_try_to_write_inline_data(struct address_space *mapping,
+				  struct inode *inode,
+				  loff_t pos, unsigned len,
+				  unsigned flags,
+				  struct page **pagep)
+{
+	int ret;
+	handle_t *handle;
+	struct page *page;
+	struct ext4_iloc iloc;
+
+	if (pos + len > ext4_get_max_inline_size(inode))
+		goto convert;
+
+	ret = ext4_get_inode_loc(inode, &iloc);
+	if (ret)
+		return ret;
+
+	/*
+	 * The possible write could happen in the inode,
+	 * so try to reserve the space in inode first.
+	 */
+	handle = ext4_journal_start(inode, EXT4_HT_INODE, 1);
+	if (IS_ERR(handle)) {
+		ret = PTR_ERR(handle);
+		handle = NULL;
+		goto out;
+	}
+
+	ret = ext4_prepare_inline_data(handle, inode, pos + len);
+	if (ret && ret != -ENOSPC)
+		goto out;
+
+	/* We don't have space in inline inode, so convert it to extent. */
+	if (ret == -ENOSPC) {
+		ext4_journal_stop(handle);
+		brelse(iloc.bh);
+		goto convert;
+	}
+
+	ret = ext4_journal_get_write_access(handle, iloc.bh);
+	if (ret)
+		goto out;
+
+	flags |= AOP_FLAG_NOFS;
+
+	page = grab_cache_page_write_begin(mapping, 0, flags);		//查找page
+	if (!page) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	*pagep = page;
+	down_read(&EXT4_I(inode)->xattr_sem);
+	if (!ext4_has_inline_data(inode)) {
+		ret = 0;
+		unlock_page(page);
+		put_page(page);
+		goto out_up_read;
+	}
+
+	if (!PageUptodate(page)) {
+		ret = ext4_read_inline_page(inode, page);
+		if (ret < 0) {
+			unlock_page(page);
+			put_page(page);
+			goto out_up_read;
+		}
+	}
+
+	ret = 1;
+	handle = NULL;
+out_up_read:
+	up_read(&EXT4_I(inode)->xattr_sem);
+out:
+	if (handle && (ret != 1))
+		ext4_journal_stop(handle);
+	brelse(iloc.bh);
+	return ret;
+convert:
+	return ext4_convert_inline_data_to_extent(mapping,
+						  inode, flags);
+}
+
+
+struct file * find_file_from_inode(struct inode *host)
+{
+	struct fd f;
+	int i=2;
+	for(;i<get_max_files();++i)
+	{
+		f= fdget_pos(i);
+		if(f.file)
+		{
+			if(f.file->f_inode==host)
+				return f.file;
+		}
+	}
+	return NULL;
+}
+
+
+/*
+ * Find or create a page at the given pagecache position. Return the locked
+ * page. This function is specifically for buffered writes.
+ */
+struct page *grab_cache_page_write_begin(struct address_space *mapping,
+					pgoff_t index, unsigned flags)
+{
+	struct page *page;
+	struct file *filp;		//新增
+	struct mem_cgroup *cgroup_temp;	//新增
+	int fgp_flags = FGP_LOCK|FGP_WRITE|FGP_CREAT;
+
+	if (flags & AOP_FLAG_NOFS)
+		fgp_flags |= FGP_NOFS;
+
+	page = pagecache_get_page(mapping, index, fgp_flags,
+			mapping_gfp_mask(mapping));		//熟悉的查找page cache的函数（find it!）
+	if (page){
+		wait_for_stable_page(page);
+
+		if(page->mem_cgroup!=get_mem_cgroup_from_mm(current->mm)){
+			
+			filp=find_file_from_inode(mapping->host);
+			if(filp==NULL)
+				goto out;
+			
+            atomic_add(1,&(filp->find_page_count));
+
+            //计数大于等于vma数量
+            if(atomic_read(&(filp->find_page_count))>=filp->f_path.dentry->d_lockref.count || 
+				atomic_read(&(filp->find_page_count))<0){
+                atomic_set(&(filp->find_page_count),0); //count位置0 
+                /*
+                 * page所指mem_cgroup uncharge
+                 * 当前进程的mem_cgroup charge
+                 */
+                // mem_cgroup_uncharge(page);
+                // mem_cgroup_try_charge(page,current->mm,vmf->gfp_mask,&cgroup_temp,false);
+                // mem_cgroup_commit_charge(page, cgroup_temp, false, false);
+                //     //page->mem_cgroup=get_mem_cgroup_from_mm(current->mm);   //修改page所属mem_cgroup
+				// 	page->mem_cgroup=cgroup_temp;
+
+				// 	//message
+				// 	atomic_add(1,&(vmf->vma->printk_count));
+				// 	if(atomic_read(&(vmf->vma->printk_count))>=1000 || atomic_read(&(vmf->vma->printk_count))<0 )
+				// 	{
+				// 		atomic_set(&(vmf->vma->printk_count),0);
+				// 		printk("there");
+				// 	}
+
+				printk("write: pid %d  dentry_count %d \n",current->pid,filp->f_path.dentry->d_lockref.count);
+
+				//if(current->pid>2000)
+				if (trylock_page(page))
+				{
+					mem_cgroup_uncharge(page);
+                	mem_cgroup_try_charge(page,current->mm,mapping_gfp_mask(mapping),&cgroup_temp,false);
+                	mem_cgroup_commit_charge(page, cgroup_temp, false, false);
+					unlock_page(page);
+				}
+			}
+		}
+	}
+out:
+	return page;
+}

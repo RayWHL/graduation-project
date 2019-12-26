@@ -1,16 +1,68 @@
 //https://elixir.bootlin.com/linux/latest/source/fs/read_write.c#L421
 
+struct lockref {
+	union {
+#if USE_CMPXCHG_LOCKREF
+		aligned_u64 lock_count;
+#endif
+		struct {
+			spinlock_t lock;
+			int count;
+		};
+	};
+};
+
+struct dentry {
+	/* RCU lookup touched fields */
+	unsigned int d_flags;		/* protected by d_lock */
+	seqcount_t d_seq;		/* per dentry seqlock */
+	struct hlist_bl_node d_hash;	/* lookup hash list */
+	struct dentry *d_parent;	/* parent directory */
+	struct qstr d_name;
+	struct inode *d_inode;		/* Where the name belongs to - NULL is
+					 * negative */
+	unsigned char d_iname[DNAME_INLINE_LEN];	/* small names */
+
+	/* Ref lookup also touches following */
+	struct lockref d_lockref;	/* per-dentry lock and refcount 包括锁与引用计数位 */
+	const struct dentry_operations *d_op;
+	struct super_block *d_sb;	/* The root of the dentry tree */
+	unsigned long d_time;		/* used by d_revalidate */
+	void *d_fsdata;			/* fs-specific data */
+
+	union {
+		struct list_head d_lru;		/* LRU list */
+		wait_queue_head_t *d_wait;	/* in-lookup ones only */
+	};
+	struct list_head d_child;	/* child of parent list */
+	struct list_head d_subdirs;	/* our children */
+	/*
+	 * d_alias and d_rcu can share memory
+	 */
+	union {
+		struct hlist_node d_alias;	/* inode alias list */
+		struct hlist_bl_node d_in_lookup_hash;	/* only for in-lookup ones */
+	 	struct rcu_head d_rcu;
+	} d_u;
+} __randomize_layout;
+
+struct path {
+	struct vfsmount *mnt;
+	struct dentry *dentry;
+} __randomize_layout;
+
 struct file {
 	union {
 		struct llist_node	fu_llist;
 		struct rcu_head 	fu_rcuhead;
 	} f_u;
-	struct path		f_path;
+	struct path		f_path;		//目录项在该结构中
 	struct inode		*f_inode;	/* cached value */
 	const struct file_operations	*f_op;
 
 	//新增一个计数位
-
+	atomic_t find_page_count;
+	
 	/*
 	 * Protects f_ep_links, f_flags.
 	 * Must not be taken from IRQ context.
@@ -263,6 +315,7 @@ static ssize_t generic_file_buffered_read(struct kiocb *iocb,
 	unsigned long offset;      /* offset into pagecache page */
 	unsigned int prev_offset;
 	int error = 0;
+	struct mem_cgroup cgroup_temp;
 
 	if (unlikely(*ppos >= inode->i_sb->s_maxbytes))
 		return 0;
@@ -287,7 +340,7 @@ find_page:
 			goto out;
 		}
 
-		page = find_get_page(mapping, index);	//查找page cache
+		page = find_get_page(mapping, index);	//查找page cache  内部调用的也是pagecache_get_page
 		if (!page) {
 			if (iocb->ki_flags & IOCB_NOWAIT)
 				goto would_block;
@@ -302,7 +355,45 @@ find_page:
 
 		else	//在page cache找到page，计数
 		{
+			if(page->mem_cgroup!=get_mem_cgroup_from_mm(current->mm)){
 			
+            atomic_add(1,&(filp->find_page_count));
+
+            //计数大于等于vma数量
+            if(atomic_read(&(filp->find_page_count))>=filp->f_path.dentry->d_lockref.count || 
+				atomic_read(&(filp->find_page_count))<0){
+                atomic_set(&(filp->find_page_count),0); //count位置0 
+                /*
+                 * page所指mem_cgroup uncharge
+                 * 当前进程的mem_cgroup charge
+                 */
+                // mem_cgroup_uncharge(page);
+                // mem_cgroup_try_charge(page,current->mm,vmf->gfp_mask,&cgroup_temp,false);
+                // mem_cgroup_commit_charge(page, cgroup_temp, false, false);
+                //     //page->mem_cgroup=get_mem_cgroup_from_mm(current->mm);   //修改page所属mem_cgroup
+				// 	page->mem_cgroup=cgroup_temp;
+
+				// 	//message
+				// 	atomic_add(1,&(vmf->vma->printk_count));
+				// 	if(atomic_read(&(vmf->vma->printk_count))>=1000 || atomic_read(&(vmf->vma->printk_count))<0 )
+				// 	{
+				// 		atomic_set(&(vmf->vma->printk_count),0);
+				// 		printk("there");
+				// 	}
+
+				printk("filemap_fault: pid %d  dentry_count %d \n",current->pid,filp->f_path.dentry->d_lockref.count);
+
+				//if(current->pid>2000)
+				if (trylock_page(page))
+				{
+					mem_cgroup_uncharge(page);
+                	mem_cgroup_try_charge(page,current->mm,gfp_mask,&cgroup_temp,false);
+                	mem_cgroup_commit_charge(page, cgroup_temp, false, false);
+					unlock_page(page);
+				}
+			}
+		}
+
 		}
 
 

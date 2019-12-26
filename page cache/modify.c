@@ -38,7 +38,21 @@
  * 3、read
  * 4、write
  * 
- * read/write没有vma结构，在vma添加计数位方法不行，考虑在file结构添加计数位？
+ * 
+ * 2019/12/24
+ * mmap的读先do_falut_around（调用了 filemap_map_pages)，然后调用 filemap_fault
+ * 		写只调用filemap_fault
+ * 
+ * 基于linux5.4.6 从新设计解决方案
+ * 1、file结构增加计数位 详见read.c中 源码位置：/include/linux/fs.h	L935
+ * 2、filemap_map_pages (do_fault_around调用) 详见modify.c  源码位置/mm/filemap.c L2623
+ * 3、filemap_fault 详见modify.c	源码位置 /mm/filemap.c L2497
+ * 4、generic_file_buffered_read  详见read.c  源码位置 /mm/filemap.c L2009
+ * 5、grab_cache_page_write_begin 详见write.c	源码位置 /mm/filemap.c	L3246
+ * 6、do_sys_open 初始化 详见open.c  源码位置 /fs/open.c L1082
+ * 总共享计数怎么获得? inode/dentry计数 open增加了哪个计数?
+ * A:总引用计数在dentry的引用计数（file结构数）
+ * 
  **/
 
 /*
@@ -123,6 +137,13 @@ struct vm_area_struct {
 } __randomize_layout;
 
 
+
+
+
+
+
+
+
 /**
  * 真正的.fault指向的函数
  * filemap_fault - read in file data for page fault handling
@@ -174,30 +195,46 @@ vm_fault_t filemap_fault(struct vm_fault *vmf)
 
 
 
-        /*
-         * 在page cache中找到该page
-         * 增加vma的计数，然后根据共享进程数，判断是否修改cgroup的计数
-         * 前面需要添加mem_cgroup *cgroup_temp;
-         */
-        //该page所属mem_cgroup不是当前进程的mem_cgroup
         if(page->mem_cgroup!=get_mem_cgroup_from_mm(current->mm)){
-            //首先对vma的共享page计数加一
-            atomic_add(1,&(vmf->vma->find_page_count));
+			//printk("%d: not same cgroup\n",current->pid);
+            //首先对file中共享page计数加一
+            //atomic_add(1,&(vmf->vma->find_page_count));
+            atomic_add(1,&(file->find_page_count));
+
             //计数大于等于vma数量
-            if(atomic_read(&(vmf->vma->find_page_count))>=atomic_read(&(mapping->i_mmap_writable))){
-                atomic_set(&(vmf->vma->find_page_count),0); //count位置0 
+            if(atomic_read(&(file->find_page_count))>=file->f_path.dentry->d_lockref.count || 
+				atomic_read(&(file->find_page_count))<0){
+                atomic_set(&(file->find_page_count),0); //count位置0 
                 /*
                  * page所指mem_cgroup uncharge
                  * 当前进程的mem_cgroup charge
                  */
-                mem_cgroup_uncharge(page);
-                if(!mem_cgroup_try_charge(page,current->mm,vmf->gfp_mask,&cgroup_temp,false)){
-                    mem_cgroup_commit_charge(page, cgroup_temp, false, false);
-                    page->mem_cgroup=get_mem_cgroup_from_mm(current->mm);   //修改page所属mem_cgroup
+                // mem_cgroup_uncharge(page);
+                // mem_cgroup_try_charge(page,current->mm,vmf->gfp_mask,&cgroup_temp,false);
+                // mem_cgroup_commit_charge(page, cgroup_temp, false, false);
+                //     //page->mem_cgroup=get_mem_cgroup_from_mm(current->mm);   //修改page所属mem_cgroup
+				// 	page->mem_cgroup=cgroup_temp;
 
-                }
-            }
-        }
+				// 	//message
+				// 	atomic_add(1,&(vmf->vma->printk_count));
+				// 	if(atomic_read(&(vmf->vma->printk_count))>=1000 || atomic_read(&(vmf->vma->printk_count))<0 )
+				// 	{
+				// 		atomic_set(&(vmf->vma->printk_count),0);
+				// 		printk("there");
+				// 	}
+
+				printk("filemap_fault: pid %d  dentry_count %d \n",current->pid,file->f_path.dentry->d_lockref.count);
+
+				//if(current->pid>2000)
+				if (trylock_page(page))
+				{
+					mem_cgroup_uncharge(page);
+                	mem_cgroup_try_charge(page,current->mm,vmf->gfp_mask,&cgroup_temp,false);
+                	mem_cgroup_commit_charge(page, cgroup_temp, false, false);
+					unlock_page(page);
+				}
+			}
+		}
 
 
 
@@ -439,7 +476,7 @@ struct address_space {
  * 
  **/
 
-//vma操作函数 map_pages指向的函数
+//vma操作函数 map_pages 指向的函数
 void filemap_map_pages(struct vm_fault *vmf,
 		pgoff_t start_pgoff, pgoff_t end_pgoff)
 {
@@ -494,9 +531,68 @@ void filemap_map_pages(struct vm_fault *vmf,
 		last_pgoff = xas.xa_index;
 		if (alloc_set_pte(vmf, NULL, page))
 			goto unlock;
+
+		
+		if(page->mem_cgroup!=get_mem_cgroup_from_mm(current->mm)){
+			//printk("%d: not same cgroup\n",current->pid);
+            //首先对file中共享page计数加一
+            //atomic_add(1,&(vmf->vma->find_page_count));
+            atomic_add(1,&(file->find_page_count));
+
+            //计数大于等于vma数量
+            if(atomic_read(&(file->find_page_count))>=file->f_path.dentry->d_lockref.count || 
+				atomic_read(&(file->find_page_count))<0){
+                atomic_set(&(file->find_page_count),0); //count位置0 
+                /*
+                 * page所指mem_cgroup uncharge
+                 * 当前进程的mem_cgroup charge
+                 */
+                // mem_cgroup_uncharge(page);
+                // mem_cgroup_try_charge(page,current->mm,vmf->gfp_mask,&cgroup_temp,false);
+                // mem_cgroup_commit_charge(page, cgroup_temp, false, false);
+                //     //page->mem_cgroup=get_mem_cgroup_from_mm(current->mm);   //修改page所属mem_cgroup
+				// 	page->mem_cgroup=cgroup_temp;
+
+				// 	//message
+				// 	atomic_add(1,&(vmf->vma->printk_count));
+				// 	if(atomic_read(&(vmf->vma->printk_count))>=1000 || atomic_read(&(vmf->vma->printk_count))<0 )
+				// 	{
+				// 		atomic_set(&(vmf->vma->printk_count),0);
+				// 		printk("there");
+				// 	}
+
+				printk("filemap_fault: pid %d  dentry_count %d \n",current->pid,file->f_path.dentry->d_lockref.count);
+
+				//if(current->pid>2000)
+				{
+					mem_cgroup_uncharge(page);
+                	mem_cgroup_try_charge(page,current->mm,vmf->gfp_mask,&cgroup_temp,false);
+                	mem_cgroup_commit_charge(page, cgroup_temp, false, false);
+				}
+
+				// uncharge_page(page);
+				// cgroup_temp=get_mem_cgroup_from_mm(current->mm);
+				// try_charge(cgroup_temp, vmf->gfp_mask ,nr_pages);
+
+				// commit_charge(page, cgroup_temp, false);
+
+				// local_irq_disable();
+				// mem_cgroup_charge_statistics(cgroup_temp, page, false, nr_pages);
+				// memcg_check_events(cgroup_temp, page);
+				// local_irq_enable();
+
+
+				
+
+
+                
+            }
+        }
+
+
 		unlock_page(page);
 
-		//在此添加操作
+		
 
 
 		goto next;

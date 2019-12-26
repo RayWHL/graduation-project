@@ -2,6 +2,7 @@
 //每次open都是一个新file结构，从filpcache中分配
 //flags标志：O_RDWR..    mode 权限标志
 //https://elixir.bootlin.com/linux/latest/source/fs/namei.c#L3547
+//reference: linux技术内幕
 SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
 {
 	if (force_o_largefile())    //判断是否支持大文件，实现为一个宏
@@ -41,6 +42,7 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 		} else {
 			fsnotify_open(f);
 			fd_install(fd, f);		//关联文件描述符与file
+			atomic_set(&(f->find_page_count),0); //count位置0 
 		}
 	}
 	putname(tmp);
@@ -79,7 +81,7 @@ static struct file *path_openat(struct nameidata *nd,
 	} else if (unlikely(file->f_flags & O_PATH)) {
 		error = do_o_path(nd, flags, file);
 	} else {
-		const char *s = path_init(nd, flags);		//准备查找路径起点
+		const char *s = path_init(nd, flags);		//准备查找路径起点，将起点的dentry inode保存到nd，起点可能是/开头的绝对路径，也可能是相对路径
 		while (!(error = link_path_walk(s, nd)) &&		//逐级路径分量查找
 			(error = do_last(nd, file, op)) > 0) {
 			nd->flags &= ~(LOOKUP_OPEN|LOOKUP_CREATE|LOOKUP_EXCL);
@@ -116,7 +118,7 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 	nd->last_type = LAST_ROOT; /* if there are only slashes... */
 	nd->flags = flags | LOOKUP_JUMPED | LOOKUP_PARENT;
 	nd->depth = 0;
-	if (flags & LOOKUP_ROOT) {
+	if (flags & LOOKUP_ROOT) {		//此标志可以通过nd提供一个路径作为根路径
 		struct dentry *root = nd->root.dentry;
 		struct inode *inode = root->d_inode;
 		if (*s && unlikely(!d_can_lookup(root)))
@@ -138,12 +140,12 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 	nd->path.dentry = NULL;
 
 	nd->m_seq = read_seqbegin(&mount_lock);
-	if (*s == '/') {
+	if (*s == '/') {	// '/'开头的根目录
 		set_root(nd);
 		if (likely(!nd_jump_root(nd)))
 			return s;
 		return ERR_PTR(-ECHILD);
-	} else if (nd->dfd == AT_FDCWD) {
+	} else if (nd->dfd == AT_FDCWD) {	//此标志可以通过该进程的task_struct->fs->pwd获得起点，
 		if (flags & LOOKUP_RCU) {
 			struct fs_struct *fs = current->fs;
 			unsigned seq;
@@ -159,7 +161,7 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 			nd->inode = nd->path.dentry->d_inode;
 		}
 		return s;
-	} else {
+	} else {			//否则根据dfd获得起点
 		/* Caller must check execute permissions on the starting path component */
 		struct fd f = fdget_raw(nd->dfd);
 		struct dentry *dentry;
@@ -185,6 +187,161 @@ static const char *path_init(struct nameidata *nd, unsigned flags)
 		fdput(f);
 		return s;
 	}
+}
+
+
+/*
+ * Name resolution.
+ * This is the basic name resolution function, turning a pathname into
+ * the final dentry. We expect 'base' to be positive and a directory.
+ *
+ * Returns 0 and nd will have valid dentry and mnt on success.
+ * Returns error and drops reference to input namei data on failure.
+ */
+static int link_path_walk(const char *name, struct nameidata *nd)
+{
+	int err;
+
+	if (IS_ERR(name))
+		return PTR_ERR(name);
+	while (*name=='/')
+		name++;
+	if (!*name)
+		return 0;
+
+	/* At this point we know we have a real path component. */
+	for(;;) {
+		u64 hash_len;
+		int type;
+
+		err = may_lookup(nd);	//检查是否有查看目录权限
+		if (err)
+			return err;
+
+		hash_len = hash_name(nd->path.dentry, name);
+
+		type = LAST_NORM;	//普通路径名类型
+		if (name[0] == '.') switch (hashlen_len(hash_len)) {
+			case 2:
+				if (name[1] == '.') {
+					type = LAST_DOTDOT;		//..
+					nd->flags |= LOOKUP_JUMPED;
+				}
+				break;
+			case 1:
+				type = LAST_DOT;	//.
+		}
+		if (likely(type == LAST_NORM)) {
+			struct dentry *parent = nd->path.dentry;
+			nd->flags &= ~LOOKUP_JUMPED;
+			if (unlikely(parent->d_flags & DCACHE_OP_HASH)) {
+				struct qstr this = { { .hash_len = hash_len }, .name = name };
+				err = parent->d_op->d_hash(parent, &this);
+				if (err < 0)
+					return err;
+				hash_len = this.hash_len;
+				name = this.name;
+			}
+		}
+
+		nd->last.hash_len = hash_len;
+		nd->last.name = name;
+		nd->last_type = type;	//确定路径类型，用于walk_component查找该分量
+
+		name += hashlen_len(hash_len);
+		if (!*name)
+			goto OK;
+		/*
+		 * If it wasn't NUL, we know it was '/'. Skip that
+		 * slash, and continue until no more slashes.
+		 */
+		do {
+			name++;
+		} while (unlikely(*name == '/'));
+		if (unlikely(!*name)) {
+OK:
+			/* pathname body, done */
+			if (!nd->depth)
+				return 0;
+			name = nd->stack[nd->depth - 1].name;
+			/* trailing symlink, done */
+			if (!name)
+				return 0;
+			/* last component of nested symlink */
+			err = walk_component(nd, WALK_FOLLOW);
+		} else {
+			/* not the last component */
+			err = walk_component(nd, WALK_FOLLOW | WALK_MORE);
+		}
+		if (err < 0)
+			return err;
+
+		if (err) {
+			const char *s = get_link(nd);
+
+			if (IS_ERR(s))
+				return PTR_ERR(s);
+			err = 0;
+			if (unlikely(!s)) {
+				/* jumped */
+				put_link(nd);
+			} else {
+				nd->stack[nd->depth - 1].name = name;
+				name = s;
+				continue;
+			}
+		}
+		if (unlikely(!d_can_lookup(nd->path.dentry))) {
+			if (nd->flags & LOOKUP_RCU) {
+				if (unlazy_walk(nd))
+					return -ECHILD;
+			}
+			return -ENOTDIR;
+		}
+	}
+}
+
+static int walk_component(struct nameidata *nd, int flags)
+{
+	struct path path;
+	struct inode *inode;
+	unsigned seq;
+	int err;
+	/*
+	 * "." and ".." are special - ".." especially so because it has
+	 * to be able to know about the current root directory and
+	 * parent relationships.
+	 */
+	if (unlikely(nd->last_type != LAST_NORM)) {
+		err = handle_dots(nd, nd->last_type);
+		if (!(flags & WALK_MORE) && nd->depth)
+			put_link(nd);
+		return err;
+	}
+	err = lookup_fast(nd, &path, &inode, &seq);		//在hash表中查找（如果以前打开过）
+	if (unlikely(err <= 0)) {
+		if (err < 0)
+			return err;
+		path.dentry = lookup_slow(&nd->last, nd->path.dentry,
+					  nd->flags);
+		if (IS_ERR(path.dentry))
+			return PTR_ERR(path.dentry);
+
+		path.mnt = nd->path.mnt;
+		err = follow_managed(&path, nd);
+		if (unlikely(err < 0))
+			return err;
+
+		if (unlikely(d_is_negative(path.dentry))) {
+			path_to_nameidata(&path, nd);
+			return -ENOENT;
+		}
+
+		seq = 0;	/* we are already out of RCU mode */
+		inode = d_backing_inode(path.dentry);
+	}
+
+	return step_into(nd, &path, flags, inode, seq);
 }
 
 
@@ -218,7 +375,7 @@ static int do_last(struct nameidata *nd,
 		if (nd->last.name[nd->last.len])
 			nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
 		/* we _can_ be in RCU mode here */
-		error = lookup_fast(nd, &path, &inode, &seq);
+		error = lookup_fast(nd, &path, &inode, &seq);		//inode缓存中查找
 		if (likely(error > 0))
 			goto finish_lookup;
 
@@ -317,7 +474,7 @@ static int do_last(struct nameidata *nd,
 	seq = 0;	/* out of RCU mode, so the value doesn't matter */
 	inode = d_backing_inode(path.dentry);
 finish_lookup:
-	error = step_into(nd, &path, 0, inode, seq);
+	error = step_into(nd, &path, 0, inode, seq);	//设置nd的一些值，包括inode
 	if (unlikely(error))
 		return error;
 finish_open:
@@ -367,4 +524,91 @@ out:
 	if (got_write)
 		mnt_drop_write(nd->path.mnt);
 	return error;
+}
+
+static int lookup_fast(struct nameidata *nd,
+		       struct path *path, struct inode **inode,
+		       unsigned *seqp)
+{
+	struct vfsmount *mnt = nd->path.mnt;
+	struct dentry *dentry, *parent = nd->path.dentry;
+	int status = 1;
+	int err;
+
+	/*
+	 * Rename seqlock is not required here because in the off chance
+	 * of a false negative due to a concurrent rename, the caller is
+	 * going to fall back to non-racy lookup.
+	 */
+	if (nd->flags & LOOKUP_RCU) {
+		unsigned seq;
+		bool negative;
+		dentry = __d_lookup_rcu(parent, &nd->last, &seq);
+		if (unlikely(!dentry)) {
+			if (unlazy_walk(nd))
+				return -ECHILD;
+			return 0;
+		}
+
+		/*
+		 * This sequence count validates that the inode matches
+		 * the dentry name information from lookup.
+		 */
+		*inode = d_backing_inode(dentry);
+		negative = d_is_negative(dentry);
+		if (unlikely(read_seqcount_retry(&dentry->d_seq, seq)))
+			return -ECHILD;
+
+		/*
+		 * This sequence count validates that the parent had no
+		 * changes while we did the lookup of the dentry above.
+		 *
+		 * The memory barrier in read_seqcount_begin of child is
+		 *  enough, we can use __read_seqcount_retry here.
+		 */
+		if (unlikely(__read_seqcount_retry(&parent->d_seq, nd->seq)))
+			return -ECHILD;
+
+		*seqp = seq;
+		status = d_revalidate(dentry, nd->flags);
+		if (likely(status > 0)) {
+			/*
+			 * Note: do negative dentry check after revalidation in
+			 * case that drops it.
+			 */
+			if (unlikely(negative))
+				return -ENOENT;
+			path->mnt = mnt;
+			path->dentry = dentry;
+			if (likely(__follow_mount_rcu(nd, path, inode, seqp)))
+				return 1;
+		}
+		if (unlazy_child(nd, dentry, seq))
+			return -ECHILD;
+		if (unlikely(status == -ECHILD))
+			/* we'd been told to redo it in non-rcu mode */
+			status = d_revalidate(dentry, nd->flags);
+	} else {
+		dentry = __d_lookup(parent, &nd->last);
+		if (unlikely(!dentry))
+			return 0;
+		status = d_revalidate(dentry, nd->flags);
+	}
+	if (unlikely(status <= 0)) {
+		if (!status)
+			d_invalidate(dentry);
+		dput(dentry);
+		return status;
+	}
+	if (unlikely(d_is_negative(dentry))) {
+		dput(dentry);
+		return -ENOENT;
+	}
+
+	path->mnt = mnt;
+	path->dentry = dentry;
+	err = follow_managed(path, nd);
+	if (likely(err > 0))
+		*inode = d_backing_inode(path->dentry);
+	return err;
 }
